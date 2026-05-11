@@ -1,4 +1,4 @@
-# Product Requirements Document (PRD)
+# Product Documentation
 **Project**: Hospital Bulk Processing System
 **Client/Company**: Paribus
 
@@ -11,15 +11,19 @@ The Hospital Bulk Processing System is a standalone microservice designed to han
 
 ## 3. Core Workflows
 1. **Upload & Validate**: A user uploads a CSV file containing hospital data (Name, Address, Phone). The system validates the data format and ensures it respects the maximum limit of 20 rows.
-2. **Batch Generation**: The system generates a unique UUID (Batch ID) to logically group the incoming records.
-3. **Concurrent Processing**: The system seamlessly dispatches the validated records to the upstream Hospital Directory API.
-4. **Batch Activation**: Upon successful creation of the records, the system triggers an activation sequence to mark all hospitals in the batch as "active."
-5. **Reporting**: The system provides a comprehensive summary detailing successes, failures, and processing time.
+2. **Synchronous Processing**: The system generates a unique UUID (Batch ID), and immediately begins processing the CSV payload synchronously, dispatching valid records to the upstream API concurrently.
+3. **Concurrent API Dispatch**: The system seamlessly dispatches the validated records to the upstream Hospital Directory API.
+4. **Batch Activation**: Upon processing all records, the system triggers an activation sequence to mark the successful hospitals in the batch as "active."
+5. **Comprehensive Response**: The system returns the complete results of the operation, including total processing time and individual hospital statuses.
+6. **Real-time Tracking**: The user can monitor the live progress of long-running operations via a WebSocket connection using their Batch ID.
+
+> **Note on Processing Model**: We opted for a synchronous "Upload & Wait" model for the primary flow to provide immediate data integrity feedback. Given the 20-row limit, this provides a better user experience than asynchronous background tasks which require the user to poll for completion.
 
 ## 4. Functional Requirements
 
 ### 4.1 Bulk CSV Upload Endpoint
-- **Endpoint**: `POST /hospitals/bulk`
+- **Endpoint**: `POST /hospitals/bulk?background=false`
+- **Parameters**: `background` (optional, default=false) — Set to `true` to process in background.
 - **Input**: `multipart/form-data` with a `.csv` file attachment.
 - **CSV Schema**: `name` (required), `address` (required), `phone` (optional).
 - **Validation**:
@@ -28,38 +32,48 @@ The Hospital Bulk Processing System is a standalone microservice designed to han
   - Row-level data validation (missing required fields).
 - **Processing Logic**:
   - Automatically create a unique Batch ID (UUID).
-  - Submit individual records to `POST /hospitals/` on the external API.
-  - If records are processed without catastrophic system failure, execute `PATCH /hospitals/batch/{batch_id}/activate`.
-- **Output**: A JSON payload containing:
-  - `batch_id`
-  - `total_hospitals`, `processed_hospitals`, `failed_hospitals`
-  - `processing_time_seconds`
-  - `batch_activated` (boolean)
-  - `hospitals` (array of objects detailing the status of each row).
+  - Dispatch concurrent requests to the upstream API and await their completion.
+- **Output**: A `200 OK` JSON payload containing the comprehensive `batch_id`, total processing time, and the exact success/failure status of every single row.
 
-### 4.2 Error Handling & Resilience
-- Graceful degradation if the upstream API times out or returns a 500.
-- Detailed row-level error reporting in the response payload.
+### 4.2 Progress Tracking
+- **Endpoint**: `WebSocket /ws/hospitals/progress/{batch_id}`
+- **Functionality**: Clients can connect to this WebSocket to receive real-time updates on the processing status of their batch as the background task runs.
+- **Updates Include**: Number of processed hospitals, failed hospitals, and final completion status. This demonstrates asynchronous job tracking capabilities.
+
+### 4.3 Resume Capability
+- **Endpoint**: `POST /hospitals/bulk/{batch_id}/resume?background=false`
+- **Parameters**: `background` (optional, default=false) — Set to `true` to process in background.
+- **Functionality**: If a bulk operation fails partially (e.g., due to an upstream API timeout or rate limit), the user can invoke this endpoint to retry only the failed records.
+- **Processing Logic**: The system will fetch the state of the batch from memory, identify which records failed, and re-attempt to push them to the upstream API synchronously, returning the updated batch result.
+
+### 4.4 Standalone CSV Validation
+- **Endpoint**: `POST /hospitals/bulk/validate`
+- **Input**: `multipart/form-data` with a `.csv` file attachment.
+- **Functionality**: Allows the user to pre-validate a CSV format and contents without actually triggering any downstream API calls or creating a batch.
+- **Output**: Detailed validation report highlighting errors (e.g., missing columns, empty rows, exceeding 20 rows).
+
+### 4.5 Error Handling & Resilience
+- **Automatic Retries**: The system utilizes the `tenacity` library to automatically retry upstream API calls if a transient network error or `502 Bad Gateway` occurs, ensuring maximum reliability.
+- Graceful degradation if the upstream API ultimately times out after retries.
 
 ## 5. Non-Functional Requirements
 
 ### 5.1 Performance & Scalability
-- **Asynchronous I/O**: The system will use asynchronous HTTP clients to process the CSV rows concurrently, ensuring minimal wait times for the end user.
-- **Statelessness**: The API will remain stateless to ensure easy horizontal scaling if required in the future.
+- **Asynchronous I/O**: The system will use native FastAPI features and `httpx` with `asyncio.gather` to process the CSV rows concurrently, ensuring the synchronous HTTP upload endpoint finishes in a matter of seconds.
+- **Statelessness**: The API routes remain stateless, interacting with a centralized in-memory state manager.
 
 ### 5.2 Modularity & Code Quality
-- Inspired by the `core-be` modular architecture, code will be separated into:
+- Following a clean, modular architecture, code is separated into:
   - `api/` (Routing and HTTP transport)
   - `services/` (Business logic, CSV parsing, Upstream API communication)
-  - `core/` (Configuration, constants, and utilities)
+  - `core/` (Configuration, state management, constants, and utilities)
   - `models/` (Pydantic data models)
 - Fully typed Python code to ensure readability and maintainability.
 
 ### 5.3 Deployment & Operations
-- **Containerization**: Fully Dockerized using best practices (similar to the `core-be` Dockerfile approach).
-- **Environment Management**: Robust environment variable handling for upstream URLs and configuration.
+- **Containerization**: Fully Dockerized using best practices.
+- **Environment Management**: Robust environment variable handling for upstream URLs.
 
 ## 6. Out of Scope (For MVP)
-- **User Authentication/Authorization**: The API will be open for the purpose of the assignment unless explicitly required.
-- **Database Persistence**: The system acts as a pure pass-through and orchestrator; it will not store hospital data locally (in-memory state is sufficient for request lifecycle).
-- **Real-Time WebSockets**: Given the strict 20-row limit, processing will be near-instantaneous. A synchronous HTTP response is more appropriate than WebSockets.
+- **User Authentication/Authorization**: Currently handled at the load balancer or infrastructure level.
+- **Persistent Database Infrastructure**: The system acts as a pure pass-through orchestrator. It uses an in-memory storage for job lifecycle tracking. Future iterations may include a persistent layer like Redis for high-availability deployments.
